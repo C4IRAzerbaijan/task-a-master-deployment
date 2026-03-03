@@ -31,3 +31,6 @@ except Exception as e:
             'detail': str(e),
             'type': type(e).__name__
         }), 500
+
+# Vercel Python runtime looks for 'app' variable (WSGI application)
+# Do NOT rename this variable
