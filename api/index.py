@@ -23,8 +23,8 @@ except Exception as e:
     startup_error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
     print(f"STARTUP ERROR: {startup_error}")
 
-    @app.route('/', defaults={'path': ''})
-    @app.route('/<path:path>')
+    @app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'])
+    @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'])
     def catch_all(path):
         return jsonify({
             'error': 'Backend failed to start',
