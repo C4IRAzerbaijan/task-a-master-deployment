@@ -1,0 +1,417 @@
+# services/blob_storage_service.py
+"""Vercel Blob Storage Service - Persistent document storage on Vercel"""
+import os
+import json
+import zipfile
+import io as _io
+from typing import Optional, Tuple, List
+import requests
+from io import BytesIO
+
+class BlobStorageService:
+    """Service to handle file uploads to Vercel Blob Storage"""
+    
+    def __init__(self, config):
+        self.config = config
+        # Check multiple possible environment variable names for Vercel Blob token
+        self.blob_token = (
+            os.getenv('BLOB_READ_WRITE_TOKEN') or 
+            os.getenv('VERCEL_BLOB_TOKEN') or 
+            os.getenv('VERCEL_BLOB_STORE_TOKEN') or
+            ''
+        )
+        self.blob_enabled = self.blob_token != ''
+        
+        if self.blob_enabled:
+            print(f"✅ Vercel Blob Storage ENABLED (token found: {self.blob_token[:30]}...)")
+            is_vercel = os.getenv('VERCEL', '') == '1'
+            if is_vercel:
+                print("   Running on Vercel - using Blob Storage for persistence")
+            else:
+                print("   Local development - Blob token found, will use Blob if needed")
+        else:
+            print("⚠️ Vercel Blob Storage DISABLED")
+            print("   Looking for: BLOB_READ_WRITE_TOKEN, VERCEL_BLOB_TOKEN, or VERCEL_BLOB_STORE_TOKEN")
+            print("   To enable: Set environment variable in Vercel dashboard")
+    
+    # ------------------------------------------------------------------ #
+    #  Core upload / download helpers                                      #
+    # ------------------------------------------------------------------ #
+
+    def _put(self, blob_path: str, data: bytes, add_random_suffix: bool = False) -> Optional[str]:
+        """
+        PUT raw bytes to blob_path.  Returns the blob URL on success, None on failure.
+        blob_path should NOT start with '/'.
+        """
+        headers = {
+            'Authorization': f'Bearer {self.blob_token}',
+            'Content-Type': 'application/octet-stream',
+            'x-vercel-blob-access': 'private',
+        }
+        if add_random_suffix:
+            headers['x-add-random-suffix'] = '1'
+        response = requests.put(
+            f'https://blob.vercel-storage.com/{blob_path}',
+            headers=headers,
+            data=data,
+            timeout=60,
+        )
+        print(f"📊 Blob PUT status: {response.status_code}")
+        print(f"📋 Blob PUT raw response: {response.text[:500]}")
+        if response.status_code in (200, 201):
+            try:
+                resp_data = response.json()
+            except Exception:
+                print(f"⚠️ Blob PUT: could not parse JSON response")
+                return None
+            # Safely extract URL from any field Vercel might use
+            url = resp_data.get('url') or ''
+            if not url:
+                dl = resp_data.get('downloadUrl') or ''
+                url = dl.split('?')[0] if dl else ''
+            if not url:
+                url = resp_data.get('pathname') or ''
+            if url:
+                return url
+            print(f"⚠️ Blob PUT succeeded but no URL in response: {resp_data}")
+            return None
+        print(f"⚠️ Blob PUT failed ({response.status_code}): {response.text[:200]}")
+        return None
+
+    def _list_blobs(self, prefix: str) -> List[dict]:
+        """Return list of blob metadata dicts whose pathname starts with prefix."""
+        try:
+            resp = requests.get(
+                'https://blob.vercel-storage.com',
+                headers={'Authorization': f'Bearer {self.blob_token}'},
+                params={'prefix': prefix},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                return resp.json().get('blobs', [])
+        except Exception as e:
+            print(f"⚠️ Blob list error: {e}")
+        return []
+
+    def _delete_by_prefix(self, prefix: str) -> None:
+        """Delete all blobs whose pathname starts with prefix."""
+        blobs = self._list_blobs(prefix)
+        if blobs:
+            urls = [b['url'] for b in blobs]
+            try:
+                requests.delete(
+                    'https://blob.vercel-storage.com',
+                    headers={
+                        'Authorization': f'Bearer {self.blob_token}',
+                        'Content-Type': 'application/json',
+                    },
+                    json={'urls': urls},
+                    timeout=15,
+                )
+            except Exception as e:
+                print(f"⚠️ Blob delete error: {e}")
+
+    # ------------------------------------------------------------------ #
+    #  Document file upload / delete / download                           #
+    # ------------------------------------------------------------------ #
+
+    def upload_file(self, file_obj, filename: str) -> Tuple[bool, str]:
+        """
+        Upload a user document to Vercel Blob Storage.
+        Returns: (success, blob_url_or_error_message)
+        """
+        if not self.blob_enabled:
+            return False, "Blob storage not configured - BLOB_READ_WRITE_TOKEN missing"
+        
+        try:
+            file_obj.seek(0)
+            file_content = file_obj.read()
+            print(f"📤 Uploading {filename} ({len(file_content)} bytes) to Vercel Blob...")
+
+            url = self._put(f'documents/{filename}', file_content, add_random_suffix=True)
+            if url:
+                print(f"✅ Upload successful: {url[:80]}...")
+                return True, url
+            return False, "Upload failed: no URL returned"
+
+        except Exception as e:
+            print(f"❌ Blob service error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False, str(e)
+
+    def delete_file(self, blob_url: str) -> bool:
+        """Delete a file from Vercel Blob Storage by its URL."""
+        if not self.blob_enabled or not blob_url:
+            return False
+        try:
+            response = requests.delete(
+                'https://blob.vercel-storage.com',
+                headers={
+                    'Authorization': f'Bearer {self.blob_token}',
+                    'Content-Type': 'application/json',
+                },
+                json={'urls': [blob_url]},
+                timeout=10,
+            )
+            success = response.status_code in (200, 204)
+            if success:
+                print("✅ File deleted from Blob Storage")
+            else:
+                print(f"⚠️ Delete response: {response.status_code}")
+            return success
+        except Exception as e:
+            print(f"⚠️ Blob delete error: {e}")
+            return False
+
+    def download_file(self, blob_url: str) -> Optional[bytes]:
+        """Download file content from a public Vercel Blob URL."""
+        if not blob_url:
+            return None
+        try:
+            print(f"📥 Downloading from Blob: {blob_url[:60]}...")
+            dl_headers = {'Authorization': f'Bearer {self.blob_token}'} if self.blob_token else {}
+            response = requests.get(blob_url, headers=dl_headers, timeout=30)
+            if response.status_code == 200:
+                print(f"✅ Downloaded {len(response.content)} bytes")
+                return response.content
+            print(f"⚠️ Download failed: {response.status_code}")
+            return None
+        except Exception as e:
+            print(f"⚠️ Blob download error: {e}")
+            return None
+
+    def get_file_stream(self, blob_url: str):
+        """Get file as a BytesIO stream from a public Vercel Blob URL."""
+        if not blob_url:
+            return None
+        try:
+            dl_headers = {'Authorization': f'Bearer {self.blob_token}'} if self.blob_token else {}
+            response = requests.get(blob_url, headers=dl_headers, timeout=30, stream=True)
+            if response.status_code == 200:
+                return BytesIO(response.content)
+            return None
+        except Exception as e:
+            print(f"Blob stream error: {e}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    #  Persistence sync – SQLite database                                 #
+    # ------------------------------------------------------------------ #
+
+    _DB_BLOB_PATH = '_system/rag_chatbot.db'
+
+    def sync_db_to_blob(self, db_path: str) -> bool:
+        """Upload the local SQLite database to Blob Storage (replaces existing).
+
+        Uses put-first / delete-old ordering so there is NEVER a window where
+        no backup exists (avoids the 'documents disappear' race condition on
+        Vercel where multiple Lambdas can run simultaneously).
+        """
+        if not self.blob_enabled:
+            return False
+        if not os.path.exists(db_path):
+            print(f"⚠️ DB sync skipped – file not found: {db_path}")
+            return False
+        try:
+            with open(db_path, 'rb') as f:
+                data = f.read()
+
+            # 1. Snapshot existing blobs BEFORE uploading
+            old_blobs = self._list_blobs(self._DB_BLOB_PATH)
+            old_urls = [b['url'] for b in old_blobs]
+
+            # 2. Upload new version first – always a valid copy exists at this point
+            url = self._put(self._DB_BLOB_PATH, data, add_random_suffix=False)
+            if not url:
+                print("⚠️ DB sync: PUT failed, keeping old backup intact")
+                return False
+
+            # 3. Delete old versions only AFTER new one is confirmed
+            if old_urls:
+                to_delete = [u for u in old_urls if u != url]
+                if to_delete:
+                    try:
+                        requests.delete(
+                            'https://blob.vercel-storage.com',
+                            headers={
+                                'Authorization': f'Bearer {self.blob_token}',
+                                'Content-Type': 'application/json',
+                            },
+                            json={'urls': to_delete},
+                            timeout=10,
+                        )
+                    except Exception as _e:
+                        print(f"⚠️ DB cleanup error (non-fatal): {_e}")
+
+            print(f"✅ DB synced to Blob ({len(data)} bytes)")
+            return True
+        except Exception as e:
+            print(f"⚠️ DB sync to blob error: {e}")
+            return False
+
+    def sync_db_from_blob(self, db_path: str) -> bool:
+        """Download the SQLite database from Blob Storage to local path."""
+        if not self.blob_enabled:
+            return False
+        try:
+            blobs = self._list_blobs(self._DB_BLOB_PATH)
+            if not blobs:
+                print("📋 No remote DB backup found – starting fresh")
+                return False
+
+            # Pick the most recently uploaded blob in case multiple exist
+            blobs.sort(key=lambda b: b.get('uploadedAt', ''), reverse=True)
+            blob_url = blobs[0]['url']
+
+            # Private store requires auth header
+            response = requests.get(
+                blob_url,
+                headers={'Authorization': f'Bearer {self.blob_token}'},
+                timeout=30,
+            )
+            if response.status_code != 200:
+                print(f"⚠️ DB download failed: {response.status_code} – {response.text[:200]}")
+                return False
+
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+            with open(db_path, 'wb') as f:
+                f.write(response.content)
+            print(f"✅ DB restored from Blob ({len(response.content)} bytes)")
+            return True
+        except Exception as e:
+            print(f"⚠️ DB sync from blob error: {e}")
+            return False
+
+    # ------------------------------------------------------------------ #
+    #  Generic file sync (for any static DB, e.g. contacts.db)          #
+    # ------------------------------------------------------------------ #
+
+    def sync_file_to_blob(self, local_path: str, blob_key: str) -> bool:
+        """Upload any local file to Blob Storage under the given key.
+        Uses put-first / delete-old to avoid a no-file window.
+        """
+        if not self.blob_enabled:
+            return False
+        if not os.path.exists(local_path):
+            print(f"⚠️ sync_file_to_blob skipped – not found: {local_path}")
+            return False
+        try:
+            old_blobs = self._list_blobs(blob_key)
+            old_urls = [b['url'] for b in old_blobs]
+
+            with open(local_path, 'rb') as f:
+                data = f.read()
+            url = self._put(blob_key, data, add_random_suffix=False)
+            if not url:
+                return False
+
+            if old_urls:
+                to_delete = [u for u in old_urls if u != url]
+                if to_delete:
+                    try:
+                        requests.delete(
+                            'https://blob.vercel-storage.com',
+                            headers={
+                                'Authorization': f'Bearer {self.blob_token}',
+                                'Content-Type': 'application/json',
+                            },
+                            json={'urls': to_delete},
+                            timeout=10,
+                        )
+                    except Exception as _e:
+                        print(f"⚠️ File cleanup error (non-fatal): {_e}")
+
+            print(f"✅ {os.path.basename(local_path)} synced to Blob ({len(data)} bytes)")
+            return True
+        except Exception as e:
+            print(f"⚠️ sync_file_to_blob error: {e}")
+            return False
+
+    def sync_file_from_blob(self, blob_key: str, local_path: str) -> bool:
+        """Download a file from Blob Storage to local_path."""
+        if not self.blob_enabled:
+            return False
+        try:
+            blobs = self._list_blobs(blob_key)
+            if not blobs:
+                print(f"📋 No remote backup found for {blob_key}")
+                return False
+            blob_url = blobs[0]['url']
+            headers = {'Authorization': f'Bearer {self.blob_token}'}
+            response = requests.get(blob_url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                print(f"⚠️ sync_file_from_blob download failed: {response.status_code}")
+                return False
+            os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+            print(f"🔄 {os.path.basename(local_path)} restored from Blob ({len(response.content)} bytes)")
+            return True
+        except Exception as e:
+            print(f"⚠️ sync_file_from_blob error: {e}")
+            return False
+
+    # ------------------------------------------------------------------ #
+    #  Persistence sync – ChromaDB vector stores                         #
+    # ------------------------------------------------------------------ #
+
+    def _chroma_blob_path(self, doc_id: int) -> str:
+        return f'_system/chroma_doc_{doc_id}.zip'
+
+    def sync_chroma_to_blob(self, doc_id: int, chroma_dir: str) -> bool:
+        """Zip and upload a document's ChromaDB directory to Blob Storage."""
+        if not self.blob_enabled:
+            return False
+        if not os.path.exists(chroma_dir):
+            print(f"⚠️ ChromaDB sync skipped – dir not found: {chroma_dir}")
+            return False
+        try:
+            blob_path = self._chroma_blob_path(doc_id)
+            self._delete_by_prefix(blob_path)
+
+            parent_dir = os.path.dirname(chroma_dir)
+            zip_buffer = _io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, _dirs, files in os.walk(chroma_dir):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        arcname = os.path.relpath(fpath, parent_dir)
+                        zf.write(fpath, arcname)
+
+            zip_data = zip_buffer.getvalue()
+            url = self._put(blob_path, zip_data, add_random_suffix=False)
+            if url:
+                print(f"🔄 ChromaDB doc_{doc_id} synced to Blob ({len(zip_data)} bytes)")
+                return True
+            return False
+        except Exception as e:
+            print(f"⚠️ ChromaDB sync to blob error: {e}")
+            return False
+
+    def sync_chroma_from_blob(self, doc_id: int, chroma_dir: str) -> bool:
+        """Download and extract a document's ChromaDB directory from Blob Storage."""
+        if not self.blob_enabled:
+            return False
+        try:
+            blob_path = self._chroma_blob_path(doc_id)
+            blobs = self._list_blobs(blob_path)
+            if not blobs:
+                print(f"📋 No remote ChromaDB backup for doc_{doc_id}")
+                return False
+
+            response = requests.get(blobs[0]['url'], timeout=60)
+            if response.status_code != 200:
+                print(f"⚠️ ChromaDB download failed: {response.status_code}")
+                return False
+
+            parent_dir = os.path.dirname(chroma_dir)
+            os.makedirs(parent_dir, exist_ok=True)
+            with zipfile.ZipFile(_io.BytesIO(response.content), 'r') as zf:
+                zf.extractall(parent_dir)
+
+            print(f"🔄 ChromaDB doc_{doc_id} restored from Blob")
+            return True
+        except Exception as e:
+            print(f"⚠️ ChromaDB sync from blob error: {e}")
+            return False

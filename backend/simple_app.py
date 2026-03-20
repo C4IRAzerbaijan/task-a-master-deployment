@@ -1,8 +1,8 @@
-# simple_app.py - Complete Enhanced Version
 """Enhanced Flask app with context-aware chat and improved document matching"""
 from services.hr_questions_handler import HRQuestionsHandler, integrate_hr_handler
 import os
 import json
+import io
 from datetime import timedelta, datetime, timezone
 from flask import Flask, jsonify, session, send_file, request, Response, send_from_directory
 from flask_cors import CORS
@@ -81,7 +81,26 @@ def create_simple_app():
     @app.errorhandler(405)
     def handle_405(e):
         return jsonify({'error': 'Method not allowed', 'method': request.method, 'path': request.path}), 405
-    
+
+    @app.after_request
+    def sync_db_after_write(response):
+        """After document mutations, persist the SQLite DB to Blob Storage.
+        Only fires for /api/documents routes (upload, delete, reprocess) to
+        avoid unnecessary blob traffic from chat/auth requests.
+        """
+        _doc_paths = ('/api/documents',)
+        if (request.method in ('POST', 'PUT', 'DELETE', 'PATCH')
+                and any(request.path.startswith(p) for p in _doc_paths)
+                and response.status_code < 500):
+            try:
+                bs = app.extensions.get('blob_storage')
+                if bs and bs.blob_enabled:
+                    from config import get_config as _gc
+                    bs.sync_db_to_blob(_gc().DATABASE_FILE)
+            except Exception as _e:
+                print(f"⚠️ after_request DB sync error: {_e}")
+        return response
+
     # Create directories - use /tmp on Vercel (only writable directory)
     if is_vercel:
         os.makedirs('/tmp/documents', exist_ok=True)
@@ -96,16 +115,65 @@ def create_simple_app():
     from services.enhanced_chat_service import EnhancedChatService
     from services.document_manager import DocumentManager
     from services.contact_db_search import enhance_rag_with_contact_search
+    from services.blob_storage_service import BlobStorageService
     
     config = get_config()
+
+    # Initialize Blob Storage first so we can restore persisted state before
+    # anything else tries to use the database or vector stores
+    blob_storage = BlobStorageService(config)
     
+    # ===== STARTUP DIAGNOSTICS =====
+    print("\n" + "="*80)
+    print("STARTUP DIAGNOSTICS")
+    print("="*80)
+    print(f"Environment: {'VERCEL' if is_vercel else 'LOCAL'}")
+    print(f"Blob Storage Enabled: {blob_storage.blob_enabled}")
+    if is_vercel:
+        blob_token_set = bool(os.getenv('BLOB_READ_WRITE_TOKEN') or os.getenv('VERCEL_BLOB_TOKEN') or os.getenv('VERCEL_BLOB_STORE_TOKEN'))
+        print(f"Blob Token Found: {blob_token_set}")
+        if not blob_token_set:
+            print("⚠️  WARNING: On Vercel but Blob token NOT set!")
+            print("    Set BLOB_READ_WRITE_TOKEN in Vercel Project Settings")
+        else:
+            print("✅  Blob Storage configured correctly")
+    print("="*80 + "\n")
+
+    # On Vercel every Lambda starts with an empty /tmp – restore the database
+    # from Blob Storage so document/user records survive across invocations
+    if blob_storage.blob_enabled:
+        print("🔄 Attempting to restore DB from Blob Storage...")
+        blob_storage.sync_db_from_blob(config.DATABASE_FILE)
+
+        # contacts.db: read-only reference database for the phone-book feature.
+        # When running locally, push it to Blob Storage so Vercel can use it.
+        # When running on Vercel, restore it to /tmp/contacts.db.
+        _local_contacts = os.path.join(os.path.dirname(__file__), 'contacts.db')
+        _tmp_contacts = '/tmp/contacts.db'
+        _CONTACTS_BLOB_KEY = '_system/contacts.db'
+
+        if is_vercel:
+            # Vercel Lambda: restore from blob into /tmp
+            if not os.path.exists(_tmp_contacts):
+                blob_storage.sync_file_from_blob(_CONTACTS_BLOB_KEY, _tmp_contacts)
+        else:
+            # Local dev with blob enabled: upload contacts.db so Vercel can find it
+            if os.path.exists(_local_contacts):
+                blob_storage.sync_file_to_blob(_local_contacts, _CONTACTS_BLOB_KEY)
+
     db_manager = DatabaseManager(config.DATABASE_FILE)
     rag_service = EnhancedRAGServiceV2(config, db_manager)
-    
+    rag_service.blob_storage = blob_storage  # inject for ChromaDB persistence
+
     # ENHANCE RAG SERVICE WITH CONTACT DB SEARCH
     rag_service = enhance_rag_with_contact_search(rag_service)
+    if not hasattr(rag_service, 'blob_storage'):
+        rag_service.blob_storage = blob_storage  # re-attach after wrapping
     
     chat_service = EnhancedChatService(db_manager, rag_service, config)
+
+    # Register blob_storage in app.extensions so the after_request hook can find it
+    app.extensions['blob_storage'] = blob_storage
 
     app = integrate_hr_handler(app, db_manager, rag_service, chat_service)
 
@@ -429,88 +497,61 @@ def create_simple_app():
                 'type': 'document_answer'
             })
         
-        # Check for template requests - delegate to enhanced chat service
-        question_lower = question.lower()
-        template_indicators = ['şablon', 'shablon', 'nümunə', 'numune', 'template', 'yüklə', 'yukle', 'download', 'link']
-        is_template_request = any(indicator in question_lower for indicator in template_indicators)
-        
-        if is_template_request:
-            # Use enhanced template search from chat service
-            template_match = chat_service.find_template_by_keywords(question)
-            
-            if template_match:
-                template_doc = template_match['document']
-                template_info = template_match['template_info']
-                
-                download_url = f"http://localhost:5000/api/documents/{template_doc['id']}/download"
-                
-                answer = f"""**📄 {template_info['template_name']} şablonu tapıldı!**
+        # Check for document download requests - always delegate to chat service
+        # (intent detection is done inside find_template_by_keywords itself)
+        template_match = chat_service.find_template_by_keywords(question)
 
-**📥 Yükləmə linki:** [Bu linkə klikləyin]({download_url})
+        if template_match:
+            template_doc = template_match['document']
+            display_name = template_match.get('doc_display_name',
+                re.sub(r'\.[^.]+$', '', template_doc['original_name']).replace('_', ' '))
 
-**ℹ️ Fayl məlumatları:**
-• **Fayl adı:** {template_doc['original_name']}
-• **Fayl tipi:** {template_doc['file_type']}
-• **Ölçü:** {template_doc['file_size']} bayt
+            # Build a download URL that works in any environment
+            base = request.url_root.rstrip('/')
+            download_url = f"{base}/api/documents/{template_doc['id']}/download"
 
-Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
-                
-                message = {
-                    'question': question,
-                    'answer': answer,
-                    'document_id': template_doc['id'],
-                    'document_name': template_doc['original_name'],
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                }
-                
-                if not conversation_id:
-                    title = f"Şablon: {question[:30]}..."
-                    conversation_id = db_manager.create_conversation(
-                        user_id=session['user_id'],
-                        document_id=template_doc['id'],
-                        title=title,
-                        messages=json.dumps([message])
-                    )
-                else:
-                    conv = db_manager.get_conversation(conversation_id, session['user_id'])
-                    if conv:
-                        messages = json.loads(conv['messages'])
-                        messages.append(message)
-                        db_manager.update_conversation(conversation_id, json.dumps(messages))
-                
-                return jsonify({
-                    'answer': answer,
-                    'conversation_id': conversation_id,
-                    'document_used': {
-                        'id': template_doc['id'],
-                        'name': template_doc['original_name']
-                    },
-                    'type': 'template_download'
-                })
+            size_kb = round((template_doc.get('file_size') or 0) / 1024, 1)
+            size_str = f"{size_kb} KB" if size_kb >= 1 else f"{template_doc.get('file_size', 0)} bayt"
+
+            answer = (
+                f"**📄 {display_name}**\n\n"
+                f"**[⬇️ Faylı yüklə]({download_url})**\n\n"
+                f"| | |\n|---|---|\n"
+                f"| Fayl adı | `{template_doc['original_name']}` |\n"
+                f"| Növ | {template_doc.get('file_type', '—')} |\n"
+                f"| Ölçü | {size_str} |\n\n"
+                f"Linki klikləyərək faylı kompüterinizə yükləyə bilərsiniz."
+            )
+
+            message = {
+                'question': question,
+                'answer': answer,
+                'document_id': template_doc['id'],
+                'document_name': template_doc['original_name'],
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+
+            if not conversation_id:
+                conversation_id = db_manager.create_conversation(
+                    user_id=session['user_id'],
+                    document_id=template_doc['id'],
+                    title=f"Fayl: {question[:40]}",
+                    messages=json.dumps([message])
+                )
             else:
-                # No template found - provide helpful message
-                answer = f"**Axtardığınız şablon tapılmadı.** 😔\n\nSistemdə mövcud şablonları görmək üçün admin ilə əlaqə saxlayın və ya \"sənədlər\" yazaraq bütün yüklənmiş faylları görə bilərsiniz."
-                
-                message = {
-                    'question': question,
-                    'answer': answer,
-                    'timestamp': datetime.now(timezone.utc).isoformat()
-                }
-                
-                if not conversation_id:
-                    title = f"Şablon axtarışı: {question[:30]}..."
-                    conversation_id = db_manager.create_conversation(
-                        user_id=session['user_id'],
-                        document_id=None,
-                        title=title,
-                        messages=json.dumps([message])
-                    )
-                
-                return jsonify({
-                    'answer': answer,
-                    'conversation_id': conversation_id,
-                    'type': 'template_not_found'
-                })
+                conv = db_manager.get_conversation(conversation_id, session['user_id'])
+                if conv:
+                    msgs = json.loads(conv['messages'])
+                    msgs.append(message)
+                    db_manager.update_conversation(conversation_id, json.dumps(msgs))
+
+            return jsonify({
+                'answer': answer,
+                'conversation_id': conversation_id,
+                'document_used': {'id': template_doc['id'], 'name': template_doc['original_name']},
+                'download_url': download_url,
+                'type': 'template_download'
+            })
         
         # USE CONTEXT-AWARE CHAT SERVICE
         print("Using context-aware chat service...")
@@ -566,47 +607,108 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
             
             print(f"Document type: {doc_type}, Is template: {is_template}")
             
-            # Save file
+            # Save file using appropriate storage method
             import uuid
             from werkzeug.utils import secure_filename
             
             filename = secure_filename(file.filename)
             unique_filename = f"{uuid.uuid4()}_{filename}"
-            file_path = os.path.join('documents', unique_filename)
             
-            os.makedirs('documents', exist_ok=True)
-            file.save(file_path)
-            print(f"File saved to: {file_path}")
+            # Check environment and storage availability
+            is_vercel = os.getenv('VERCEL', '') == '1'
+            blob_url = None
+            file_path = None
+            is_blob = False
             
-            if not os.path.exists(file_path):
-                return jsonify({'error': 'Fayl saxlanmadı'}), 500
+            # Force Blob Storage on Vercel, LOCAL filesystem for development
+            if is_vercel:
+                # MUST USE BLOB STORAGE ON VERCEL - no local fallback
+                if not (blob_storage and blob_storage.blob_enabled):
+                    print(f"❌ VERCEL DETECTED but Blob Storage NOT enabled")
+                    return jsonify({
+                        'error': 'Blob Storage not configured on Vercel',
+                        'details': 'Environment variable BLOB_READ_WRITE_TOKEN (or VERCEL_BLOB_TOKEN) is missing',
+                        'instructions': [
+                            'Set environment variable in Vercel Project Settings',
+                            'Variable name: BLOB_READ_WRITE_TOKEN (or VERCEL_BLOB_TOKEN)',
+                            'Value: Get from Vercel Blob Storage settings',
+                            'Then redeploy'
+                        ]
+                    }), 400
+                
+                # Upload to Blob Storage
+                print("✅ Using Vercel Blob Storage")
+                file.seek(0)
+                success, result = blob_storage.upload_file(file, unique_filename)
+                
+                if not success:
+                    print(f"❌ Blob upload failed: {result}")
+                    return jsonify({'error': f'Blob upload failed: {result}'}), 500
+                
+                blob_url = result
+                file_path = blob_url
+                is_blob = True
+                print(f"✅ File uploaded to Blob Storage: {blob_url[:80]}...")
+            else:
+                # Local development - use local filesystem
+                print("🖥️ Local development - using local filesystem storage")
+                file_path = os.path.join('documents', unique_filename)
+                os.makedirs('documents', exist_ok=True)
+                file.seek(0)
+                file.save(file_path)
+                print(f"✅ File saved to: {file_path}")
+                
+                if not os.path.exists(file_path):
+                    return jsonify({'error': 'Fayl saxlanmadı'}), 500
             
             # Get file info
-            file_size = os.path.getsize(file_path)
+            if is_blob:
+                # For blob storage, use the size from the upload
+                file.seek(0, os.SEEK_END)
+                file_size = file.tell()
+                print(f"Blob file size: {file_size}")
+            else:
+                file_size = os.path.getsize(file_path)
+                print(f"Local file size: {file_size}")
+            
             file_type = os.path.splitext(filename)[1].upper().replace('.', '')
             
-            print(f"File size: {file_size}, File type: {file_type}")
+            print(f"File type: {file_type}")
             
             # Save to database
             try:
-                doc_id = db_manager.execute_query(
-                    """INSERT INTO documents 
-                       (filename, original_name, file_path, file_size, file_type, 
-                        uploaded_by, document_type, is_template, is_processed) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (unique_filename, filename, file_path, file_size, file_type, 
-                     session['user_id'], doc_type, is_template, False)
+                doc_id = db_manager.create_document(
+                    filename=unique_filename,
+                    original_name=filename,
+                    file_path=file_path,
+                    file_size=file_size,
+                    file_type=file_type,
+                    uploaded_by=session['user_id'],
+                    is_blob_storage=is_blob
                 )
                 print(f"Document saved to database with ID: {doc_id}")
             except Exception as db_error:
                 print(f"Database error: {db_error}")
-                if os.path.exists(file_path):
+                # Clean up file if error
+                if is_blob and blob_url:
+                    blob_storage.delete_file(blob_url)
+                elif not is_blob and os.path.exists(file_path):
                     os.remove(file_path)
                 return jsonify({'error': f'Database xətası: {str(db_error)}'}), 500
             
             # Process with RAG
             try:
-                success = rag_service.process_document(file_path, doc_id)
+                if is_blob:
+                    # Download and process from blob storage
+                    file_content = blob_storage.download_file(blob_url)
+                    if file_content:
+                        success = rag_service.process_document_from_bytes(file_content, doc_id, filename)
+                    else:
+                        success = False
+                else:
+                    # Process from local filesystem
+                    success = rag_service.process_document(file_path, doc_id)
+                
                 if success:
                     db_manager.update_document_processed(doc_id, True)
                     print("Document processed successfully")
@@ -614,6 +716,8 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
                     print("Document processing failed")
             except Exception as process_error:
                 print(f"Processing error: {process_error}")
+                import traceback
+                traceback.print_exc()
                 success = False
             
             return jsonify({
@@ -625,7 +729,8 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
                     'document_type': doc_type,
                     'size': file_size,
                     'is_processed': success,
-                    'is_template': is_template
+                    'is_template': is_template,
+                    'storage_type': 'blob' if is_blob else 'local'
                 }
             }), 201
             
@@ -648,10 +753,21 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
             if not doc:
                 return jsonify({'error': 'Sənəd tapılmadı'}), 404
             
-            if not os.path.exists(doc['file_path']):
-                return jsonify({'error': 'Fayl tapılmadı'}), 404
+            file_path = doc['file_path']
+            is_blob = doc.get('is_blob_storage', False)
             
-            file_size = os.path.getsize(doc['file_path'])
+            # Get file content
+            if is_blob:
+                print(f"Downloading from Blob Storage: {file_path}")
+                file_content = blob_storage.download_file(file_path)
+                if not file_content:
+                    return jsonify({'error': 'Fayl tapılmadı'}), 404
+                file_size = len(file_content)
+            else:
+                print(f"Downloading from local filesystem: {file_path}")
+                if not os.path.exists(file_path):
+                    return jsonify({'error': 'Fayl tapılmadı'}), 404
+                file_size = os.path.getsize(file_path)
             
             # MIME type mapping
             file_extension = os.path.splitext(doc['original_name'])[1].lower()
@@ -666,30 +782,40 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
             }
             mimetype = mime_types.get(file_extension, 'application/octet-stream')
             
-            def generate():
-                with open(doc['file_path'], 'rb') as f:
-                    while True:
-                        chunk = f.read(8192)
-                        if not chunk:
-                            break
-                        yield chunk
-            
-            response = Response(
-                generate(),
-                mimetype=mimetype,
-                headers={
-                    'Content-Disposition': f'attachment; filename="{doc["original_name"]}"',
-                    'Content-Length': str(file_size),
-                    'Content-Type': mimetype,
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    'Pragma': 'no-cache',
-                    'Expires': '0',
-                    'Accept-Ranges': 'bytes'
-                }
-            )
-            
-            print(f"Sending file: {doc['original_name']} ({file_size} bytes)")
-            return response
+            if is_blob:
+                # For blob storage, send content directly
+                return send_file(
+                    io.BytesIO(file_content),
+                    mimetype=mimetype,
+                    as_attachment=True,
+                    download_name=doc['original_name']
+                )
+            else:
+                # For local filesystem, stream the file
+                def generate():
+                    with open(file_path, 'rb') as f:
+                        while True:
+                            chunk = f.read(8192)
+                            if not chunk:
+                                break
+                            yield chunk
+                
+                response = Response(
+                    generate(),
+                    mimetype=mimetype,
+                    headers={
+                        'Content-Disposition': f'attachment; filename="{doc["original_name"]}"',
+                        'Content-Length': str(file_size),
+                        'Content-Type': mimetype,
+                        'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        'Pragma': 'no-cache',
+                        'Expires': '0',
+                        'Accept-Ranges': 'bytes'
+                    }
+                )
+                
+                print(f"Sending file: {doc['original_name']} ({file_size} bytes)")
+                return response
             
         except Exception as e:
             print(f"Download error: {e}")
@@ -704,9 +830,19 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
         if not doc:
             return jsonify({'error': 'Sənəd tapılmadı'}), 404
         
-        # Delete file
-        if os.path.exists(doc['file_path']):
-            os.remove(doc['file_path'])
+        # Delete file based on storage type
+        is_blob = doc.get('is_blob_storage', False)
+        file_path = doc['file_path']
+        
+        if is_blob and blob_storage:
+            # Delete from Blob Storage
+            print(f"Deleting file from Blob Storage: {file_path}")
+            blob_storage.delete_file(file_path)
+        else:
+            # Delete local file
+            if os.path.exists(file_path):
+                print(f"Deleting local file: {file_path}")
+                os.remove(file_path)
         
         # Delete vector store
         rag_service.delete_document_vectors(doc_id)
@@ -727,8 +863,8 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
             if not doc:
                 return jsonify({'error': 'Sənəd tapılmadı'}), 404
             
-            if not os.path.exists(doc['file_path']):
-                return jsonify({'error': 'Fayl tapılmadı'}), 404
+            file_path = doc['file_path']
+            is_blob = doc.get('is_blob_storage', False)
             
             print(f"Reprocessing document: {doc['original_name']}")
             
@@ -742,7 +878,17 @@ Linkə klikləyərək şablonu kompüterinizə yükləyə bilərsiniz."""
             )
             
             # Reprocess with enhanced keyword extraction
-            success = rag_service.process_document(doc['file_path'], doc_id)
+            if is_blob:
+                # Download and process from blob storage
+                file_content = blob_storage.download_file(file_path)
+                if not file_content:
+                    return jsonify({'error': 'Fayl Blob Storage-dan alına bilmədi'}), 500
+                success = rag_service.process_document_from_bytes(file_content, doc_id, doc['original_name'])
+            else:
+                # Process from local filesystem
+                if not os.path.exists(file_path):
+                    return jsonify({'error': 'Fayl tapılmadı'}), 404
+                success = rag_service.process_document(file_path, doc_id)
             
             if success:
                 db_manager.update_document_processed(doc_id, True)
