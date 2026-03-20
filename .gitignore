@@ -155,12 +155,6 @@ dist-ssr/
 # Rollup
 .rollup.cache/
 
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-!backend/contacts.db
-
 # Flask session files
 flask_session/
 

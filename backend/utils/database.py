@@ -51,6 +51,10 @@ class DatabaseManager:
                     file_type TEXT,
                     uploaded_by INTEGER NOT NULL,
                     is_processed BOOLEAN DEFAULT FALSE,
+                    is_blob_storage BOOLEAN DEFAULT FALSE,
+                    document_type TEXT DEFAULT 'other',
+                    is_template BOOLEAN DEFAULT FALSE,
+                    keywords TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (uploaded_by) REFERENCES users (id)
                 )
@@ -80,6 +84,30 @@ class DatabaseManager:
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 )
             ''')
+            
+            # Add missing columns to existing tables (migrations)
+            # Check if is_blob_storage column exists in documents table
+            cursor.execute("PRAGMA table_info(documents)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            if 'is_blob_storage' not in columns:
+                print("📦 Migrating documents table: adding is_blob_storage column")
+                cursor.execute('''ALTER TABLE documents ADD COLUMN is_blob_storage BOOLEAN DEFAULT FALSE''')
+            
+            # Check if document_type column exists
+            if 'document_type' not in columns:
+                print("📦 Migrating documents table: adding document_type column")
+                cursor.execute('''ALTER TABLE documents ADD COLUMN document_type TEXT DEFAULT 'other''''')
+            
+            # Check if is_template column exists
+            if 'is_template' not in columns:
+                print("📦 Migrating documents table: adding is_template column")
+                cursor.execute('''ALTER TABLE documents ADD COLUMN is_template BOOLEAN DEFAULT FALSE''')
+            
+            # Check if keywords column exists
+            if 'keywords' not in columns:
+                print("📦 Migrating documents table: adding keywords column")
+                cursor.execute('''ALTER TABLE documents ADD COLUMN keywords TEXT''')
             
             # Create indexes
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)')
@@ -162,13 +190,13 @@ class DatabaseManager:
     
     def create_document(self, filename: str, original_name: str, 
                        file_path: str, file_size: int, file_type: str,
-                       uploaded_by: int) -> int:
+                       uploaded_by: int, is_blob_storage: bool = False) -> int:
         """Create a document record"""
         return self.execute_query(
             '''INSERT INTO documents 
-               (filename, original_name, file_path, file_size, file_type, uploaded_by) 
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (filename, original_name, file_path, file_size, file_type, uploaded_by)
+               (filename, original_name, file_path, file_size, file_type, uploaded_by, is_blob_storage) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (filename, original_name, file_path, file_size, file_type, uploaded_by, is_blob_storage)
         )
     
     def update_document_processed(self, doc_id: int, processed: bool = True) -> None:
